@@ -58,7 +58,8 @@ export type UnifiClient = {
 	type: 'WIRED' | 'WIRELESS' | string
 	name: string
 	ipAddress?: string
-	macAddress: string
+	/** Missing for VPN/Teleport clients. */
+	macAddress?: string
 	uplinkDeviceId?: string
 }
 
@@ -71,6 +72,27 @@ export type UnifiResult<T> =
 
 function baseUrl(config: UnifiClientConfig): string {
 	return `https://${config.host}:${config.port}/proxy/network/integration/v1`
+}
+
+const MAX_ERROR_DETAIL_LENGTH = 200
+
+/**
+ * Builds a short, log-safe error message from an HTTP error response. Uses the `message` field of a JSON
+ * error body if present, otherwise only the status code (HTML error pages are not copied into logs).
+ */
+export function httpErrorMessage(status: number, body: string): string {
+	let detail = ''
+	try {
+		const parsed = JSON.parse(body) as { message?: unknown; meta?: { msg?: unknown } }
+		const candidate = parsed.message ?? parsed.meta?.msg
+		if (typeof candidate === 'string') detail = candidate
+	} catch {
+		// not JSON
+	}
+	// eslint-disable-next-line no-control-regex
+	detail = detail.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim()
+	if (detail.length > MAX_ERROR_DETAIL_LENGTH) detail = `${detail.slice(0, MAX_ERROR_DETAIL_LENGTH)}...`
+	return `HTTP ${status}${detail ? `: ${detail}` : ''}`
 }
 
 function errorMessage(err: unknown): string {
@@ -126,7 +148,7 @@ async function requestAction(config: UnifiClientConfig, path: string, action: st
 		if (response.status === 404) return { outcome: 'not-found' }
 		if (!response.ok) {
 			const body = await response.text().catch(() => '')
-			return { outcome: 'error', message: `HTTP ${response.status}${body ? `: ${body}` : ''}` }
+			return { outcome: 'error', message: httpErrorMessage(response.status, body) }
 		}
 		return { outcome: 'ok', data: undefined }
 	} catch (err) {
@@ -148,14 +170,18 @@ type PagedResponse<T> = {
 async function requestAllPages<T>(config: UnifiClientConfig, path: string): Promise<UnifiResult<T[]>> {
 	const separator = path.includes('?') ? '&' : '?'
 	const items: T[] = []
+	let offset = 0
 	for (let page = 0; page < MAX_PAGES; page++) {
-		const offset = page * PAGE_LIMIT
 		const result = await request<PagedResponse<T>>(config, `${path}${separator}limit=${PAGE_LIMIT}&offset=${offset}`)
 		if (result.outcome !== 'ok') return result
-		items.push(...result.data.data)
-		if (items.length >= result.data.totalCount || result.data.data.length === 0) break
+		const pageItems = result.data.data ?? []
+		items.push(...pageItems)
+		// Advance by what was actually returned, a short page must not skip items.
+		offset += pageItems.length
+		if (pageItems.length === 0 || offset >= result.data.totalCount) return { outcome: 'ok', data: items }
 	}
-	return { outcome: 'ok', data: items }
+	// Returning truncated data would e.g. mark missing clients as offline.
+	return { outcome: 'error', message: `More than ${MAX_PAGES * PAGE_LIMIT} entries for ${path}` }
 }
 
 export async function getApplicationInfo(

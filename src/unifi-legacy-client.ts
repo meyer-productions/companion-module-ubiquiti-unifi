@@ -1,4 +1,5 @@
 import { Agent } from 'undici'
+import { httpErrorMessage } from './unifi-client.js'
 
 // EXPERIMENTAL / LEGACY: talks to the old private UniFi-OS controller API because the
 // official Integration API has no config-write endpoint for ports (verified: no
@@ -58,14 +59,34 @@ function errorMessage(err: unknown): string {
 	return String(err)
 }
 
-async function rawFetch(url: string, init: RequestInit): Promise<Response> {
+type RawResponse = { status: number; ok: boolean; headers: Headers; body: string }
+
+/** Fetches a URL and reads the whole body within the same timeout (so a stalled body cannot hang forever). */
+async function rawFetch(url: string, init: RequestInit): Promise<RawResponse> {
 	const controller = new AbortController()
 	const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
 	try {
-		return await fetch(url, { ...init, signal: controller.signal, dispatcher: insecureAgent } as unknown as RequestInit)
+		const response = await fetch(url, {
+			...init,
+			signal: controller.signal,
+			dispatcher: insecureAgent,
+		} as unknown as RequestInit)
+		const body = await response.text()
+		return { status: response.status, ok: response.ok, headers: response.headers, body }
 	} finally {
 		clearTimeout(timeout)
 	}
+}
+
+/** The classic API can report errors inside an HTTP 200 response (`meta.rc !== 'ok'`). */
+function classicError(body: string): string | undefined {
+	try {
+		const parsed = JSON.parse(body) as { meta?: { rc?: unknown } }
+		if (parsed.meta?.rc !== undefined && parsed.meta.rc !== 'ok') return httpErrorMessage(200, body)
+	} catch {
+		return 'Invalid response from the classic controller API'
+	}
+	return undefined
 }
 
 export async function login(config: UnifiLegacyConfig): Promise<UnifiLegacyResult<LegacySession>> {
@@ -77,7 +98,8 @@ export async function login(config: UnifiLegacyConfig): Promise<UnifiLegacyResul
 		})
 
 		if (response.status === 401 || response.status === 403) return { outcome: 'unauthorized' }
-		if (!response.ok) return { outcome: 'error', message: `Login failed: HTTP ${response.status}` }
+		if (!response.ok)
+			return { outcome: 'error', message: `Login failed: ${httpErrorMessage(response.status, response.body)}` }
 
 		const setCookies = typeof response.headers.getSetCookie === 'function' ? response.headers.getSetCookie() : []
 		if (setCookies.length === 0) return { outcome: 'error', message: 'Login response did not contain session cookies' }
@@ -106,9 +128,11 @@ async function getClassicDeviceByMac(
 		)
 		if (response.status === 401 || response.status === 403) return { outcome: 'unauthorized' }
 		if (response.status === 404) return { outcome: 'not-found' }
-		if (!response.ok) return { outcome: 'error', message: `HTTP ${response.status}` }
+		if (!response.ok) return { outcome: 'error', message: httpErrorMessage(response.status, response.body) }
+		const apiError = classicError(response.body)
+		if (apiError) return { outcome: 'error', message: apiError }
 
-		const body = (await response.json()) as { data?: ClassicDevice[] }
+		const body = JSON.parse(response.body) as { data?: ClassicDevice[] }
 		const device = body.data?.[0]
 		if (!device) return { outcome: 'not-found' }
 		return { outcome: 'ok', data: device }
@@ -170,10 +194,9 @@ export async function setPortPoeMode(
 			},
 		)
 		if (response.status === 401 || response.status === 403) return { outcome: 'unauthorized' }
-		if (!response.ok) {
-			const text = await response.text().catch(() => '')
-			return { outcome: 'error', message: `HTTP ${response.status}${text ? `: ${text}` : ''}` }
-		}
+		if (!response.ok) return { outcome: 'error', message: httpErrorMessage(response.status, response.body) }
+		const apiError = classicError(response.body)
+		if (apiError) return { outcome: 'error', message: apiError }
 		return { outcome: 'ok', data: undefined }
 	} catch (err) {
 		if (err instanceof Error && err.name === 'AbortError') return { outcome: 'timeout' }

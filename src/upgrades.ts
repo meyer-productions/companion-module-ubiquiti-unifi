@@ -51,13 +51,13 @@ export const UpgradeScripts: CompanionStaticUpgradeScript<ModuleConfig, ModuleSe
 	// Add new upgrade scripts here when config/action/feedback shapes change.
 	// Remember that once one has been added it cannot be removed!
 
-	// v1.x: default the site to "default"
+	// v1.x: default the site to "default" (unchanged from the original JavaScript module)
 	(
 		_context: CompanionUpgradeContext<ModuleConfig>,
 		{ config }: CompanionStaticUpgradeProps<ModuleConfig, ModuleSecrets>,
 	): CompanionStaticUpgradeResult<ModuleConfig, ModuleSecrets> => {
 		const legacy = config as (Partial<ModuleConfig> & LegacyModuleConfig) | null
-		if (!legacy || legacy.site || legacy.siteId) {
+		if (!legacy || legacy.site) {
 			return { updatedConfig: null, updatedActions: [], updatedFeedbacks: [] }
 		}
 

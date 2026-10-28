@@ -38,6 +38,8 @@ export type ModuleSchema = {
 
 export { UpgradeScripts }
 
+const MAC_PATTERN = /^[0-9a-f]{2}([:-]?[0-9a-f]{2}){5}$/i
+
 function normalizeMac(value: string): string {
 	return value.toLowerCase().replace(/[^0-9a-f]/g, '')
 }
@@ -94,8 +96,13 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	}
 
 	async configUpdated(config: ModuleConfig, secrets: ModuleSecrets): Promise<void> {
+		this.stopPolling()
 		this.config = config
 		this.secrets = secrets
+
+		// Config dependent definitions (e.g. the legacy PoE action) must follow the config even when offline.
+		this.updateActions()
+		this.updateFeedbacks()
 
 		await this.refreshDevices()
 		this.startPolling()
@@ -193,7 +200,10 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		if (!value) return ''
 		if (this.devices.some((device) => device.id === value)) return value
 		const mac = normalizeMac(value)
-		return this.devices.find((device) => normalizeMac(device.macAddress) === mac)?.id ?? value
+		const match = this.devices.find((device) => normalizeMac(device.macAddress) === mac)
+		if (match) return match.id
+		// A MAC address that matches no known device must not be sent to the API as a device ID.
+		return MAC_PATTERN.test(value) ? '' : value
 	}
 
 	/** Reads the switch/port selection of an action or feedback built with getSwitchAndPortFields. */
@@ -201,10 +211,11 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		const rawDeviceId = typeof options.deviceId === 'string' ? options.deviceId.trim() : ''
 		if (!rawDeviceId) return undefined
 		const deviceId = this.resolveSwitchId(rawDeviceId)
+		if (!deviceId) return undefined
 		const portIdx = Number(
 			options[this.portFieldId(rawDeviceId)] ?? options[this.portFieldId(deviceId)] ?? options[MIGRATED_PORT_OPTION],
 		)
-		if (Number.isNaN(portIdx)) return undefined
+		if (!Number.isInteger(portIdx) || portIdx < 1) return undefined
 		return { deviceId, portIdx }
 	}
 
@@ -220,7 +231,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	/** Whether the client with this MAC address is currently connected to the network. */
 	isClientOnline(macAddress: string): boolean {
-		return this.connectedClientMacs.has(macAddress)
+		return this.connectedClientMacs.has(macAddress.toLowerCase())
 	}
 
 	/** Number of clients currently connected to a specific device (e.g. an access point). */
@@ -394,16 +405,19 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		const connectedMacs = new Set<string>()
 		const countByUplink = new Map<string, number>()
 		for (const client of clientsResult.data) {
-			connectedMacs.add(client.macAddress)
-			if (!this.knownClients.has(client.macAddress)) hasNewClients = true
-			this.knownClients.set(client.macAddress, {
-				name: client.name,
-				ipAddress: client.ipAddress,
-				macAddress: client.macAddress,
-			})
 			if (client.uplinkDeviceId) {
 				countByUplink.set(client.uplinkDeviceId, (countByUplink.get(client.uplinkDeviceId) ?? 0) + 1)
 			}
+			// VPN/Teleport clients have no MAC address and cannot be tracked by it.
+			if (!client.macAddress) continue
+			const macAddress = client.macAddress.toLowerCase()
+			connectedMacs.add(macAddress)
+			if (!this.knownClients.has(macAddress)) hasNewClients = true
+			this.knownClients.set(macAddress, {
+				name: client.name || macAddress,
+				ipAddress: client.ipAddress,
+				macAddress,
+			})
 		}
 		this.connectedClientMacs = connectedMacs
 		this.clientCountByUplink = countByUplink
@@ -425,7 +439,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.setVariableValues({
 			connection_status: 'ok',
 			application_version: this.applicationVersion,
-			site_id: this.config.siteId,
+			site_id: this.resolvedSiteId || this.config.siteId,
 			device_count: this.devices.length,
 			device_count_online: this.devices.filter((device) => device.state === 'ONLINE').length,
 			last_poll_time: new Date().toLocaleString(),

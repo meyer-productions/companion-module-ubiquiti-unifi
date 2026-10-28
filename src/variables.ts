@@ -34,7 +34,7 @@ export function UpdateVariableDefinitions(self: ModuleInstance): void {
 	const definitions: Record<string, CompanionVariableDefinition> = {
 		connection_status: { name: 'Connection status' },
 		application_version: { name: 'UniFi Network application version' },
-		site_id: { name: 'Site ID' },
+		site_id: { name: 'Site ID (resolved)' },
 		device_count: { name: 'Number of devices' },
 		device_count_online: { name: 'Number of devices online' },
 		last_poll_time: { name: 'Last update' },

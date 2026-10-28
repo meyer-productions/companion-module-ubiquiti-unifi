@@ -2,7 +2,7 @@
 
 Controls Ubiquiti UniFi Network devices via the **official, local Integration API** (API key, no session
 cookies) instead of the old private controller API. The connection therefore also works with 2FA protected
-accounts and does not break with every firmware update.
+accounts, and the documented API is expected to stay more stable across firmware updates than the private one.
 
 ### Configuration
 

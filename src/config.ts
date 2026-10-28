@@ -102,6 +102,7 @@ export function GetConfigFields(knownSites: UnifiSite[] = []): SomeCompanionConf
 				'local admin account WITHOUT 2FA/cloud SSO. May break without notice after firmware updates.',
 			width: 12,
 			default: false,
+			disableAutoExpression: true,
 		},
 		{
 			type: 'textinput',
