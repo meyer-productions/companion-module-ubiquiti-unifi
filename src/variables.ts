@@ -30,6 +30,28 @@ export function slugifyMac(macAddress: string): string {
 	return macAddress.toLowerCase().replace(/[^a-z0-9]+/g, '_')
 }
 
+/**
+ * Builds the variable slug per device ID. Normally this is just the slugified device name; only if two devices
+ * end up with the same slug (or a name has no usable characters) the last 6 hex digits of the MAC address are
+ * appended, so existing variable names stay unchanged and no device silently overwrites another one.
+ */
+export function buildDeviceSlugs(devices: { id: string; name: string; macAddress: string }[]): Map<string, string> {
+	const counts = new Map<string, number>()
+	for (const device of devices) {
+		const slug = slugify(device.name)
+		counts.set(slug, (counts.get(slug) ?? 0) + 1)
+	}
+
+	const slugs = new Map<string, string>()
+	for (const device of devices) {
+		const slug = slugify(device.name)
+		const macSuffix = slugifyMac(device.macAddress).replace(/_/g, '').slice(-6)
+		if (!slug) slugs.set(device.id, `device_${macSuffix}`)
+		else slugs.set(device.id, (counts.get(slug) ?? 0) > 1 ? `${slug}_${macSuffix}` : slug)
+	}
+	return slugs
+}
+
 export function UpdateVariableDefinitions(self: ModuleInstance): void {
 	const definitions: Record<string, CompanionVariableDefinition> = {
 		connection_status: { name: 'Connection status' },
@@ -41,16 +63,17 @@ export function UpdateVariableDefinitions(self: ModuleInstance): void {
 		last_action_result: { name: 'Last action result' },
 	}
 
+	const slugs = self.getDeviceSlugs()
 	for (const device of self.devices) {
-		const slug = slugify(device.name)
+		const slug = slugs.get(device.id) ?? slugify(device.name)
 		definitions[`device_${slug}_online`] = { name: `${device.name}: online (Online/Offline)` }
 		if (device.features.includes('accessPoint')) {
 			definitions[`device_${slug}_client_count`] = { name: `${device.name}: connected clients` }
 		}
 	}
 
-	for (const detail of self.deviceDetails.values()) {
-		const slug = slugify(detail.name)
+	for (const [deviceId, detail] of self.deviceDetails) {
+		const slug = slugs.get(deviceId) ?? slugify(detail.name)
 		for (const port of detail.ports ?? []) {
 			if (!port.poe) continue
 			definitions[`port_${slug}_${port.idx}_link`] = { name: `${detail.name} port ${port.idx}: link state (up/down)` }

@@ -12,7 +12,8 @@
 		"build:main": "tsc -p tsconfig.build.json",
 		"dev": "tsc -p tsconfig.build.json --watch",
 		"lint:raw": "eslint",
-		"lint": "run lint:raw ."
+		"lint": "run lint:raw .",
+		"test": "node --import tsx --test \"src/__tests__/*.spec.ts\""
 	},
 	"license": "MIT",
 	"repository": {

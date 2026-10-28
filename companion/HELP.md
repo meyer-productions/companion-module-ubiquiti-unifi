@@ -8,6 +8,8 @@ accounts, and the documented API is expected to stay more stable across firmware
 
 - **Host / IP** — IP address or hostname of the UniFi console (UDM, UDM Pro, UDR, Cloud Key, ...).
 - **Port** — usually 443 on UniFi OS consoles.
+- **Verify TLS certificate** — off by default, because UniFi consoles use a self-signed certificate. Only enable it
+  if the console uses a certificate this machine trusts.
 - **API Key** — created on the console itself under _Settings → Control Plane → Integrations_.
 - **Site ID / Site** — usually `default`. Before the first successful connection this is a free text field;
   once the module knows the sites of the console it automatically becomes a dropdown of the real sites. With
@@ -83,6 +85,10 @@ Version 3.0 replaces the old username/password login (node-unifi) with the offic
 - **Switchport: Power Cycle** becomes **Switchport: PoE power cycle**, **Switchport: Set POE mode** becomes
   **Switchport: Set PoE on/off (legacy)**. Migrated actions still reference the switch by MAC address, which is
   resolved to the device automatically; re-selecting the switch in the dropdown is optional. The mode
-  _24V passive_ is migrated to _PoE on_.
+  _24V passive_ is migrated to _PoE on_ (auto) — the module never switches a port to passive PoE.
+- The "SSL Verify" setting is taken over as **Verify TLS certificate**.
+- Old actions whose switch MAC address or port number was an **expression** are not migrated (the new switch
+  field cannot be an expression) and have to be recreated. A mode expression is converted (on unless it
+  evaluates to `off`).
 - **Profile: Set POE Mode** has no replacement, because the Integration API offers no write access to port
   profiles. These actions remain unknown and have to be replaced manually.

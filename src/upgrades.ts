@@ -31,17 +31,13 @@ function optionString(options: CompanionMigrationOptionValues, key: string): str
 	return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : ''
 }
 
-/** Converts an old `POECycle`/`POEMode` action (switch MAC + port number) to the new switch/port options. */
+/** Converts an old `POECycle`/`POEMode` action (static switch MAC + port number) to the new switch/port options. */
 function migrateSwitchPortOptions(action: CompanionMigrationAction): void {
-	const mac = action.options.mac
-	const port = action.options.port
-
-	action.options.deviceId =
-		mac?.isExpression === true ? mac : { value: optionString(action.options, 'mac').toLowerCase(), isExpression: false }
-	action.options[MIGRATED_PORT_OPTION] =
-		port?.isExpression === true
-			? port
-			: { value: Number(optionString(action.options, 'port')) || 1, isExpression: false }
+	action.options.deviceId = { value: optionString(action.options, 'mac').toLowerCase(), isExpression: false }
+	action.options[MIGRATED_PORT_OPTION] = {
+		value: Number(optionString(action.options, 'port')) || 1,
+		isExpression: false,
+	}
 
 	delete action.options.mac
 	delete action.options.port
@@ -71,6 +67,8 @@ export const UpgradeScripts: CompanionStaticUpgradeScript<ModuleConfig, ModuleSe
 	// - POECycle -> powerCyclePort, POEMode -> setPortPoePersistent. Both used the switch MAC address; the new
 	//   actions resolve a MAC address to the device at runtime (see main.ts resolveSwitchId).
 	// - ProfilePOEMode has no equivalent (the Integration API has no port profile write access) and is left as is.
+	// - Actions whose switch or port is an expression are left as is: the switch field of the new actions cannot be
+	//   an expression (it decides which port field is shown), so they cannot be converted reliably.
 	(
 		_context: CompanionUpgradeContext<ModuleConfig>,
 		{ config, secrets, actions }: CompanionStaticUpgradeProps<ModuleConfig, ModuleSecrets>,
@@ -79,20 +77,25 @@ export const UpgradeScripts: CompanionStaticUpgradeScript<ModuleConfig, ModuleSe
 		let usesPoeMode = false
 
 		for (const action of actions) {
-			if (action.actionId === 'POECycle') {
-				migrateSwitchPortOptions(action)
-				action.actionId = 'powerCyclePort'
-				updatedActions.push(action)
-			} else if (action.actionId === 'POEMode') {
-				// The legacy action only knows on/off; '24V passive' is mapped to on (auto).
-				const enabled = optionString(action.options, 'mode') !== 'off'
-				migrateSwitchPortOptions(action)
+			if (action.actionId !== 'POECycle' && action.actionId !== 'POEMode') continue
+			if (action.options.mac?.isExpression || action.options.port?.isExpression) continue
+
+			if (action.actionId === 'POEMode') {
+				// The new action only knows on/off and never sets passive PoE: 'off' stays off, everything else
+				// ('auto', '24V passive') becomes on (auto). A mode expression is kept as an equivalent expression.
+				const mode = action.options.mode
+				action.options.enabled =
+					mode?.isExpression && typeof mode.value === 'string'
+						? { value: `(${mode.value}) != 'off'`, isExpression: true }
+						: { value: optionString(action.options, 'mode') !== 'off', isExpression: false }
 				delete action.options.mode
-				action.options.enabled = { value: enabled, isExpression: false }
 				action.actionId = 'setPortPoePersistent'
-				updatedActions.push(action)
 				usesPoeMode = true
+			} else {
+				action.actionId = 'powerCyclePort'
 			}
+			migrateSwitchPortOptions(action)
+			updatedActions.push(action)
 		}
 
 		const legacy = config as (Partial<ModuleConfig> & LegacyModuleConfig) | null
@@ -103,6 +106,7 @@ export const UpgradeScripts: CompanionStaticUpgradeScript<ModuleConfig, ModuleSe
 		const updatedConfig: ModuleConfig = {
 			host: legacy.host ?? '',
 			port: Number(legacy.port) || 443,
+			verifyTls: legacy.sslverify === true,
 			siteId: legacy.site || 'default',
 			pollInterval: 15,
 			enableLegacyPoeToggle: usesPoeMode,

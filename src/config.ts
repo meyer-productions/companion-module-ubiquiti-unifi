@@ -4,6 +4,7 @@ import type { UnifiSite } from './unifi-client.js'
 export type ModuleConfig = {
 	host: string
 	port: number
+	verifyTls: boolean
 	siteId: string
 	pollInterval: number
 	enableLegacyPoeToggle: boolean
@@ -73,6 +74,16 @@ export function GetConfigFields(knownSites: UnifiSite[] = []): SomeCompanionConf
 			min: 1,
 			max: 65535,
 			default: 443,
+		},
+		{
+			type: 'checkbox',
+			id: 'verifyTls',
+			label: 'Verify TLS certificate',
+			tooltip:
+				'Only enable if the console uses a certificate trusted by this machine. ' +
+				'UniFi consoles use a self-signed certificate by default.',
+			width: 12,
+			default: false,
 		},
 		{
 			type: 'secret-text',

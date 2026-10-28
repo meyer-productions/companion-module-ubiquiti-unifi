@@ -4,15 +4,21 @@ const REQUEST_TIMEOUT_MS = 8000
 const PAGE_LIMIT = 100
 const MAX_PAGES = 20
 
-// UniFi-OS consoles serve the Integration API behind a self-signed local certificate.
-// This agent is scoped to UniFi client calls only, never applied globally.
+// UniFi-OS consoles serve the Integration API behind a self-signed local certificate by default, so
+// certificate verification is opt-in. Both agents are scoped to UniFi calls only, never applied globally.
 const insecureAgent = new Agent({ connect: { rejectUnauthorized: false } })
+const verifyingAgent = new Agent()
+
+export function dispatcherFor(verifyTls: boolean): Agent {
+	return verifyTls ? verifyingAgent : insecureAgent
+}
 
 export type UnifiClientConfig = {
 	host: string
 	port: number
 	siteId: string
 	apiKey: string
+	verifyTls: boolean
 }
 
 export type UnifiSite = {
@@ -111,7 +117,7 @@ async function request<T>(config: UnifiClientConfig, path: string): Promise<Unif
 			method: 'GET',
 			headers: { 'X-API-KEY': config.apiKey, Accept: 'application/json' },
 			signal: controller.signal,
-			dispatcher: insecureAgent,
+			dispatcher: dispatcherFor(config.verifyTls),
 		} as unknown as RequestInit)
 
 		if (response.status === 401 || response.status === 403) return { outcome: 'unauthorized' }
@@ -141,7 +147,7 @@ async function requestAction(config: UnifiClientConfig, path: string, action: st
 			},
 			body: JSON.stringify({ action }),
 			signal: controller.signal,
-			dispatcher: insecureAgent,
+			dispatcher: dispatcherFor(config.verifyTls),
 		} as unknown as RequestInit)
 
 		if (response.status === 401 || response.status === 403) return { outcome: 'unauthorized' }

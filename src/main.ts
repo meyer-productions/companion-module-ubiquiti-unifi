@@ -7,7 +7,7 @@ import {
 	type CompanionInputFieldDropdown,
 } from '@companion-module/base'
 import { GetConfigFields, type ModuleConfig, type ModuleSecrets } from './config.js'
-import { UpdateVariableDefinitions, slugify, slugifyMac, type VariablesSchema } from './variables.js'
+import { UpdateVariableDefinitions, buildDeviceSlugs, slugifyMac, type VariablesSchema } from './variables.js'
 import { UpgradeScripts, MIGRATED_PORT_OPTION } from './upgrades.js'
 import { UpdateActions, type ActionsSchema } from './actions.js'
 import { UpdateFeedbacks, type FeedbacksSchema } from './feedbacks.js'
@@ -26,7 +26,7 @@ import {
 	type UnifiResult,
 	type UnifiSite,
 } from './unifi-client.js'
-import { setPortPoeMode, type UnifiLegacyConfig } from './unifi-legacy-client.js'
+import { UnifiLegacyClient } from './unifi-legacy-client.js'
 
 export type ModuleSchema = {
 	config: ModuleConfig
@@ -50,11 +50,12 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	devices: UnifiDevice[] = []
 	deviceDetails: Map<string, UnifiDeviceDetail> = new Map()
-	/** Every client seen during this session (key: MAC address), used for stable online/offline variables. */
+	/** Every client seen during this session (key: lower case MAC address), used for stable online/offline variables. */
 	knownClients: Map<string, { name: string; ipAddress?: string; macAddress: string }> = new Map()
 	private connectedClientMacs: Set<string> = new Set()
 	/** Number of currently connected clients per uplink device (key: device ID), e.g. clients per access point. */
 	private clientCountByUplink: Map<string, number> = new Map()
+	private deviceSlugs: Map<string, string> = new Map()
 	applicationVersion = ''
 	lastActionResult = ''
 	/** Resolved site UUID (the Integration API only accepts UUIDs, no "default" alias like the old API). */
@@ -62,7 +63,16 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	/** Sites found on the last successful connection, used to offer the site as a dropdown in the config UI. */
 	knownSites: UnifiSite[] = []
 
-	private pollTimer: ReturnType<typeof setInterval> | undefined
+	private pollTimer: ReturnType<typeof setTimeout> | undefined
+	/**
+	 * Incremented on every config change and on destroy. Refresh/poll work started under an older generation
+	 * stops at its next step and never writes its (stale) results.
+	 */
+	private generation = 0
+	private destroyed = false
+	/** Refreshes and polls run strictly one after another through this chain. */
+	private refreshQueue: Promise<void> = Promise.resolve()
+	private legacyClient: UnifiLegacyClient | undefined
 
 	constructor(internal: unknown) {
 		super(internal)
@@ -88,24 +98,40 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.updateVariableDefinitions()
 
 		await this.refreshDevices()
-		this.startPolling()
+		this.schedulePoll()
 	}
 
 	async destroy(): Promise<void> {
+		this.destroyed = true
+		this.generation++
 		this.stopPolling()
+		await this.resetLegacyClient()
 	}
 
 	async configUpdated(config: ModuleConfig, secrets: ModuleSecrets): Promise<void> {
+		this.generation++
 		this.stopPolling()
+
+		const connectionChanged =
+			config.host !== this.config.host ||
+			config.port !== this.config.port ||
+			config.siteId !== this.config.siteId ||
+			secrets.apiKey !== this.secrets.apiKey
 		this.config = config
 		this.secrets = secrets
+		await this.resetLegacyClient()
+
+		// Data of another console/site must not stay visible in dropdowns, presets, feedbacks or variables.
+		if (connectionChanged) this.clearSiteData()
 
 		// Config dependent definitions (e.g. the legacy PoE action) must follow the config even when offline.
 		this.updateActions()
 		this.updateFeedbacks()
+		this.updatePresets()
+		this.updateVariableDefinitions()
 
 		await this.refreshDevices()
-		this.startPolling()
+		this.schedulePoll()
 	}
 
 	getConfigFields(): SomeCompanionConfigField[] {
@@ -130,6 +156,11 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 
 	getDeviceChoices(): DropdownChoice[] {
 		return this.devices.map((device) => ({ id: device.id, label: `${device.name} (${device.model})` }))
+	}
+
+	/** Variable slug per device ID, unique across all devices (see variables.ts buildDeviceSlugs). */
+	getDeviceSlugs(): Map<string, string> {
+		return this.deviceSlugs
 	}
 
 	/** Device dropdown limited to switches (only those have ports), used by the power cycle/PoE actions and feedbacks. */
@@ -212,9 +243,12 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		if (!rawDeviceId) return undefined
 		const deviceId = this.resolveSwitchId(rawDeviceId)
 		if (!deviceId) return undefined
-		const portIdx = Number(
-			options[this.portFieldId(rawDeviceId)] ?? options[this.portFieldId(deviceId)] ?? options[MIGRATED_PORT_OPTION],
-		)
+		// Migrated actions (switch given as MAC address) carry their port in the migration key; a per switch port
+		// field may only exist there as a default value filled in by Companion, so it must not take precedence.
+		const portValue = MAC_PATTERN.test(rawDeviceId)
+			? (options[MIGRATED_PORT_OPTION] ?? options[this.portFieldId(deviceId)])
+			: (options[this.portFieldId(deviceId)] ?? options[MIGRATED_PORT_OPTION])
+		const portIdx = Number(portValue)
 		if (!Number.isInteger(portIdx) || portIdx < 1) return undefined
 		return { deviceId, portIdx }
 	}
@@ -245,7 +279,20 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			port: this.config.port,
 			siteId: this.resolvedSiteId || this.config.siteId,
 			apiKey: this.secrets.apiKey,
+			verifyTls: this.config.verifyTls === true,
 		}
+	}
+
+	private clearSiteData(): void {
+		this.devices = []
+		this.deviceDetails = new Map()
+		this.deviceSlugs = new Map()
+		this.knownClients = new Map()
+		this.connectedClientMacs = new Set()
+		this.clientCountByUplink = new Map()
+		this.knownSites = []
+		this.resolvedSiteId = ''
+		this.applicationVersion = ''
 	}
 
 	/**
@@ -254,73 +301,108 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 	 * the site is matched by name/internalReference/ID; with exactly one site that site is always used,
 	 * regardless of the configured value.
 	 */
-	private async resolveSiteId(): Promise<UnifiResult<string>> {
+	private async resolveSiteId(): Promise<UnifiResult<{ siteId: string; sites: UnifiSite[] }>> {
 		const sitesResult = await listSites(this.clientConfig())
 		if (sitesResult.outcome !== 'ok') return sitesResult
-		this.knownSites = sitesResult.data
+		const sites = sitesResult.data
 
-		if (sitesResult.data.length > 1) {
-			this.log(
-				'info',
-				`Multiple sites found: ${sitesResult.data.map((site) => `${site.name} (${site.id})`).join(', ')}`,
-			)
+		if (sites.length > 1) {
+			this.log('info', `Multiple sites found: ${sites.map((site) => `${site.name} (${site.id})`).join(', ')}`)
 		}
 
-		if (sitesResult.data.length === 1) {
-			return { outcome: 'ok', data: sitesResult.data[0].id }
+		if (sites.length === 1) {
+			return { outcome: 'ok', data: { siteId: sites[0].id, sites } }
 		}
 
 		const wanted = this.config.siteId?.trim()
-		const match = sitesResult.data.find(
-			(site) => site.id === wanted || site.internalReference === wanted || site.name === wanted,
-		)
+		const match = sites.find((site) => site.id === wanted || site.internalReference === wanted || site.name === wanted)
 		if (!match) return { outcome: 'not-found' }
-		return { outcome: 'ok', data: match.id }
+		return { outcome: 'ok', data: { siteId: match.id, sites } }
 	}
 
-	private legacyConfig(): UnifiLegacyConfig {
-		// The legacy API addresses sites by their short name (internalReference, e.g. "default"), not by UUID.
-		const site = this.knownSites.find((candidate) => candidate.id === this.resolvedSiteId)
-		return {
-			host: this.config.host,
-			port: this.config.port,
-			siteId: site?.internalReference || this.config.siteId,
-			username: this.config.legacyUsername,
-			password: this.secrets.legacyPassword,
+	/** One legacy session per connection, created on first use (see unifi-legacy-client.ts). */
+	private getLegacyClient(): UnifiLegacyClient {
+		if (!this.legacyClient) {
+			// The legacy API addresses sites by their short name (internalReference, e.g. "default"), not by UUID.
+			const site = this.knownSites.find((candidate) => candidate.id === this.resolvedSiteId)
+			this.legacyClient = new UnifiLegacyClient({
+				host: this.config.host,
+				port: this.config.port,
+				siteId: site?.internalReference || this.config.siteId,
+				username: this.config.legacyUsername,
+				password: this.secrets.legacyPassword,
+				verifyTls: this.config.verifyTls === true,
+			})
 		}
+		return this.legacyClient
+	}
+
+	private async resetLegacyClient(): Promise<void> {
+		const client = this.legacyClient
+		this.legacyClient = undefined
+		await client?.logout()
 	}
 
 	private stopPolling(): void {
 		if (this.pollTimer) {
-			clearInterval(this.pollTimer)
+			clearTimeout(this.pollTimer)
 			this.pollTimer = undefined
 		}
 	}
 
-	private startPolling(): void {
+	/** Schedules the next poll only after the previous one has finished, so polls can never pile up. */
+	private schedulePoll(): void {
 		this.stopPolling()
 
 		const seconds = this.config.pollInterval
+		if (this.destroyed || !seconds || seconds <= 0) return
 
-		if (!seconds || seconds <= 0) {
-			return
-		}
-
-		this.pollTimer = setInterval(() => {
-			this.pollState().catch((error) => {
-				this.log('error', `Polling failed: ${error instanceof Error ? error.message : String(error)}`)
+		const generation = this.generation
+		this.pollTimer = setTimeout(() => {
+			this.pollTimer = undefined
+			void this.pollState().finally(() => {
+				if (generation === this.generation) this.schedulePoll()
 			})
 		}, seconds * 1000)
 	}
 
+	/** Runs refresh/poll work one after another; work queued under an older generation is skipped. */
+	private async enqueue(work: (generation: number) => Promise<void>): Promise<void> {
+		const generation = this.generation
+		this.refreshQueue = this.refreshQueue
+			.then(async () => {
+				if (generation === this.generation) await work(generation)
+			})
+			.catch((error) => {
+				this.log('error', `Refresh failed: ${error instanceof Error ? error.message : String(error)}`)
+			})
+		return this.refreshQueue
+	}
+
+	private isStale(generation: number): boolean {
+		return generation !== this.generation
+	}
+
 	/** Reloads the complete device/port list and rebuilds dropdown choices and presets. */
 	async refreshDevices(): Promise<void> {
+		return this.enqueue(async (generation) => this.doRefreshDevices(generation))
+	}
+
+	/** Regular, lightweight poll: online state + PoE state, without rebuilding dropdowns/presets. */
+	async pollState(): Promise<void> {
+		return this.enqueue(async (generation) => this.doPollState(generation))
+	}
+
+	private async doRefreshDevices(generation: number): Promise<void> {
 		if (!this.config.host || !this.secrets.apiKey) {
+			this.clearSiteData()
+			this.rebuildDefinitions()
 			this.updateStatus(InstanceStatus.BadConfig, 'Host and API key are required.')
 			return
 		}
 
 		const infoResult = await getApplicationInfo(this.clientConfig())
+		if (this.isStale(generation)) return
 		if (infoResult.outcome !== 'ok') {
 			this.applyConnectionError(infoResult, 'Connection to the UniFi console failed.')
 			return
@@ -328,77 +410,128 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		this.applicationVersion = infoResult.data.applicationVersion
 
 		const siteResult = await this.resolveSiteId()
+		if (this.isStale(generation)) return
 		if (siteResult.outcome !== 'ok') {
 			this.applyConnectionError(siteResult, `Site "${this.config.siteId}" could not be resolved.`)
 			return
 		}
-		this.resolvedSiteId = siteResult.data
+		if (siteResult.data.siteId !== this.resolvedSiteId) this.clearSiteData()
+		this.knownSites = siteResult.data.sites
+		this.resolvedSiteId = siteResult.data.siteId
 
 		const devicesResult = await listDevices(this.clientConfig())
+		if (this.isStale(generation)) return
 		if (devicesResult.outcome !== 'ok') {
 			this.applyConnectionError(devicesResult, 'Device list could not be loaded.')
 			return
 		}
-		this.devices = devicesResult.data
+		this.setDevices(devicesResult.data)
 
-		await this.refreshSwitchPortDetails()
-		await this.refreshClients()
+		const warnings = await this.refreshSwitchPortDetails(generation)
+		if (this.isStale(generation)) return
+		const clientsResult = await this.refreshClients(generation)
+		if (this.isStale(generation)) return
+		if (clientsResult.warning) warnings.push(clientsResult.warning)
 
-		this.updateStatus(InstanceStatus.Ok)
-		this.updateActions()
-		this.updateFeedbacks()
-		this.updatePresets()
-		this.updateVariableDefinitions()
-		this.checkFeedbacks('deviceOnline', 'portPoePowered', 'clientOnline')
-		this.updateConnectionVariables()
-		this.updateDeviceAndPortVariables()
-		this.updateClientVariables()
+		this.rebuildDefinitions()
+		this.applyPollResult(warnings)
 	}
 
-	/** Regular, lightweight poll: online state + PoE state, without rebuilding dropdowns/presets. */
-	async pollState(): Promise<void> {
+	private async doPollState(generation: number): Promise<void> {
+		if (!this.config.host || !this.secrets.apiKey) return
+
+		// Without a resolved site (e.g. the console was unreachable at startup) only a full refresh can recover.
+		if (!this.resolvedSiteId) return this.doRefreshDevices(generation)
+
 		const devicesResult = await listDevices(this.clientConfig())
+		if (this.isStale(generation)) return
 		if (devicesResult.outcome !== 'ok') {
 			this.applyConnectionError(devicesResult, 'Polling failed.')
 			return
 		}
-		this.devices = devicesResult.data
+		const devicesChanged = this.setDevices(devicesResult.data)
 
-		await this.refreshSwitchPortDetails()
-		const clientsChanged = await this.refreshClients()
-		if (clientsChanged) {
+		const warnings = await this.refreshSwitchPortDetails(generation)
+		if (this.isStale(generation)) return
+		const clientsResult = await this.refreshClients(generation)
+		if (this.isStale(generation)) return
+		if (clientsResult.warning) warnings.push(clientsResult.warning)
+
+		if (devicesChanged) {
+			this.rebuildDefinitions()
+		} else if (clientsResult.hasNewClients) {
 			this.updateVariableDefinitions()
 			this.updateFeedbacks()
 		}
+		this.applyPollResult(warnings)
+	}
 
-		this.updateStatus(InstanceStatus.Ok)
+	/** Stores the device list; returns whether devices were added, removed or renamed. */
+	private setDevices(devices: UnifiDevice[]): boolean {
+		const signature = (list: UnifiDevice[]): string =>
+			list
+				.map((device) => `${device.id}|${device.name}|${device.features.join(',')}`)
+				.sort()
+				.join('\n')
+		const changed = signature(devices) !== signature(this.devices)
+		this.devices = devices
+		this.deviceSlugs = buildDeviceSlugs(devices)
+		return changed
+	}
+
+	private rebuildDefinitions(): void {
+		this.updateActions()
+		this.updateFeedbacks()
+		this.updatePresets()
+		this.updateVariableDefinitions()
+	}
+
+	private applyPollResult(warnings: string[]): void {
+		if (warnings.length > 0) {
+			this.updateStatus(InstanceStatus.UnknownWarning, warnings.join(' '))
+			for (const warning of warnings) this.log('warn', warning)
+		} else {
+			this.updateStatus(InstanceStatus.Ok)
+		}
 		this.checkFeedbacks('deviceOnline', 'portPoePowered', 'clientOnline')
 		this.updateConnectionVariables()
 		this.updateDeviceAndPortVariables()
 		this.updateClientVariables()
 	}
 
-	private async refreshSwitchPortDetails(): Promise<void> {
+	/**
+	 * Rebuilds the port details for the current switches. Removed switches are dropped; for a switch whose
+	 * details cannot be loaded the last known state is kept and a warning is returned (shown in the status).
+	 */
+	private async refreshSwitchPortDetails(generation: number): Promise<string[]> {
+		const warnings: string[] = []
+		const details = new Map<string, UnifiDeviceDetail>()
 		const switches = this.devices.filter((device) => device.features.includes('switching'))
 		for (const device of switches) {
 			const detailResult = await getDevice(this.clientConfig(), device.id)
+			if (this.isStale(generation)) return warnings
 			if (detailResult.outcome === 'ok') {
-				this.deviceDetails.set(device.id, detailResult.data)
+				details.set(device.id, detailResult.data)
+			} else {
+				const previous = this.deviceDetails.get(device.id)
+				if (previous) details.set(device.id, previous)
+				warnings.push(`Port state of ${device.name} could not be loaded (${detailResult.outcome}).`)
 			}
 		}
+		this.deviceDetails = details
+		return warnings
 	}
 
 	/**
 	 * Queries the currently connected clients and maintains `knownClients`/`connectedClientMacs`.
 	 * The clients API only returns connected clients (there is no "OFFLINE" state), so the module remembers
 	 * every client it has seen and derives "offline" from a client missing in the current response.
-	 * Returns whether new clients were added (variable definitions need to be rebuilt then).
 	 */
-	private async refreshClients(): Promise<boolean> {
+	private async refreshClients(generation: number): Promise<{ hasNewClients: boolean; warning?: string }> {
 		const clientsResult = await listClients(this.clientConfig())
+		if (this.isStale(generation)) return { hasNewClients: false }
 		if (clientsResult.outcome !== 'ok') {
-			this.log('warn', `Clients could not be queried: ${clientsResult.outcome}`)
-			return false
+			return { hasNewClients: false, warning: `Clients could not be queried (${clientsResult.outcome}).` }
 		}
 
 		let hasNewClients = false
@@ -421,7 +554,7 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		}
 		this.connectedClientMacs = connectedMacs
 		this.clientCountByUplink = countByUplink
-		return hasNewClients
+		return { hasNewClients }
 	}
 
 	/** Updates the client_<mac>_online variables from `connectedClientMacs`. */
@@ -452,15 +585,17 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 		const values: Record<string, string | number> = {}
 
 		for (const device of this.devices) {
-			const slug = slugify(device.name)
+			const slug = this.deviceSlugs.get(device.id)
+			if (!slug) continue
 			values[`device_${slug}_online`] = device.state === 'ONLINE' ? 'Online' : 'Offline'
 			if (device.features.includes('accessPoint')) {
 				values[`device_${slug}_client_count`] = this.getClientCount(device.id)
 			}
 		}
 
-		for (const detail of this.deviceDetails.values()) {
-			const slug = slugify(detail.name)
+		for (const [deviceId, detail] of this.deviceDetails) {
+			const slug = this.deviceSlugs.get(deviceId)
+			if (!slug) continue
 			for (const port of detail.ports ?? []) {
 				if (!port.poe) continue
 				values[`port_${slug}_${port.idx}_link`] = port.state === 'UP' ? 'up' : 'down'
@@ -505,13 +640,10 @@ export default class ModuleInstance extends InstanceBase<ModuleSchema> {
 			return
 		}
 
-		const result = await setPortPoeMode(this.legacyConfig(), device.macAddress, portIdx, enabled ? 'auto' : 'off')
+		const result = await this.getLegacyClient().setPortPoeMode(device.macAddress, portIdx, enabled ? 'auto' : 'off')
 		this.recordActionResult(`setPortPoePersistent(${deviceId}:${portIdx}, ${enabled ? 'on' : 'off'})`, result)
 
-		if (result.outcome === 'ok') {
-			await this.refreshSwitchPortDetails()
-			this.checkFeedbacks('portPoePowered')
-		}
+		if (result.outcome === 'ok') await this.pollState()
 	}
 
 	private recordActionResult(label: string, result: { outcome: string; message?: string }): void {
