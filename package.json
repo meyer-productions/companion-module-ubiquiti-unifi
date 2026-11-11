@@ -1,6 +1,6 @@
 {
 	"name": "ubiquiti-unifi",
-	"version": "3.0.0",
+	"version": "3.0.2",
 	"description": "Bitfocus Companion module for Ubiquiti UniFi Network (official Integration API)",
 	"main": "dist/main.js",
 	"type": "module",
